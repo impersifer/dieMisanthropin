@@ -13,150 +13,100 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-
-    # Avoid overlapping runs (queue new runs until the current finishes)
     concurrency:
       group: refresh-telegram-video-${{ github.ref }}
       cancel-in-progress: false
 
     steps:
-      - name: Checkout repo (read/write)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Make sure we have the latest main
-        shell: bash
-        run: |
-          # ensure we are tracking remote main and up-to-date before reading state.json
-          git fetch --all --prune
-          git checkout main || git checkout -b main origin/main
-          git reset --hard origin/main
-
-      - name: Install jq & curl
+      - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y jq curl
 
-      - name: Run refresh script (verbose, robust)
+      - name: Get state from gist (or create gist)
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID || '' }}
+          STATE_FILE: state.json
+        run: |
+          set -euo pipefail
+          AUTH_HEADER="Authorization: token ${GIST_TOKEN}"
+          if [ -n "${GIST_ID}" ]; then
+            echo "Fetching existing gist ${GIST_ID}..."
+            GIST_JSON=$(curl -s -H "$AUTH_HEADER" "https://api.github.com/gists/${GIST_ID}")
+            if echo "$GIST_JSON" | jq -e '.message' >/dev/null 2>&1; then
+              echo "Failed to fetch gist id=${GIST_ID}:"
+              echo "$GIST_JSON" | jq .
+              exit 1
+            fi
+            echo "$GIST_JSON" | jq -r '.files["state.json"].content // empty' > "$STATE_FILE" || echo "{}" > "$STATE_FILE"
+          else
+            echo "No GIST_ID secret provided: creating a new gist..."
+            PAYLOAD=$(jq -n '{ "description":"telegram-state-for-refresh-video", "public": false, "files": { "state.json": {"content": "{}"} } }')
+            CREATE=$(curl -s -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$PAYLOAD" https://api.github.com/gists)
+            GIST_ID_OUT=$(echo "$CREATE" | jq -r '.id // empty')
+            if [ -z "$GIST_ID_OUT" ]; then
+              echo "Failed to create gist:" && echo "$CREATE" | jq .
+              exit 1
+            fi
+            echo "Created gist id: $GIST_ID_OUT"
+            echo "Please save this id as the repo secret GIST_ID for future runs."
+            echo "$CREATE" | jq -r '.files["state.json"].content // {}' > "$STATE_FILE"
+            # print id for convenience
+            echo "GIST_ID=$GIST_ID_OUT"
+            # optionally write to file so logs show it (but secret is needed afterwards)
+          fi
+
+      - name: Refresh Telegram video (use gist-state)
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state.json
-          VIDEO_PATH: :3.mp4
+          VIDEO_PATH: video.mp4
           EXTERNAL_VIDEO_URL: ""
         run: |
           set -euo pipefail
           API="https://api.telegram.org/bot${BOT_TOKEN}"
+          MESSAGE_ID=$(jq -r '.message_id // empty' "$STATE_FILE" || echo "")
+          FILE_ID=$(jq -r '.file_id // empty' "$STATE_FILE" || echo "")
 
-          # ensure we have freshest state.json (re-check after latest fetch)
-          git fetch origin main
-          git reset --hard origin/main
-
-          # load previous state
-          MESSAGE_ID=""
-          FILE_ID=""
-          if [ -f "$STATE_FILE" ]; then
-            MESSAGE_ID=$(jq -r '.message_id // empty' "$STATE_FILE" || echo "")
-            FILE_ID=$(jq -r '.file_id // empty' "$STATE_FILE" || echo "")
-          fi
-
-          echo "Starting refresh at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          echo "Prev message_id: '${MESSAGE_ID:-<empty>}'"
-          echo "Prev file_id: '${FILE_ID:0:8}... (redacted if present)'"
-
-          # delete old message (best-effort)
+          echo "Prev message_id: ${MESSAGE_ID:-<empty>}"
           if [ -n "$MESSAGE_ID" ]; then
-            echo "Deleting previous message id=$MESSAGE_ID..."
-            DEL_RESP=$(curl -s -X POST "${API}/deleteMessage" -d chat_id="${CHAT_ID}" -d message_id="${MESSAGE_ID}" -w "\n__HTTP_CODE__:%{http_code}")
-            HTTP_CODE=$(echo "$DEL_RESP" | tail -n1 | sed -E 's/__HTTP_CODE__:(.*)/\1/')
-            DEL_JSON=$(echo "$DEL_RESP" | sed '$d')
-            echo "deleteMessage http:$HTTP_CODE ->"
-            echo "$DEL_JSON" | jq . || true
-            # proceed even if delete failed (message might already be gone)
-          else
-            echo "No previous message id found; skipping delete."
+            curl -s -X POST "${API}/deleteMessage" -d chat_id="${CHAT_ID}" -d message_id="${MESSAGE_ID}" || true
           fi
 
-          # optionally download external video if provided
           if [ -z "$FILE_ID" ] && [ -n "$EXTERNAL_VIDEO_URL" ]; then
-            echo "Downloading external video..."
             curl -sSfL "$EXTERNAL_VIDEO_URL" -o /tmp/video.mp4
             VIDEO_PATH="/tmp/video.mp4"
           fi
 
-          # send video (with safe logging + retry for transient errors)
-          attempt=0
-          max_attempts=3
-          while [ $attempt -lt $max_attempts ]; do
-            attempt=$((attempt+1))
-            echo "Send attempt #$attempt..."
-            if [ -n "$FILE_ID" ]; then
-              SEND_RAW=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST "${API}/sendVideo" -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true)
-            else
-              if [ ! -f "$VIDEO_PATH" ]; then
-                echo "No file at $VIDEO_PATH. Set VIDEO_PATH or EXTERNAL_VIDEO_URL." >&2
-                exit 1
-              fi
-              SEND_RAW=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
-            fi
+          if [ -n "$FILE_ID" ]; then
+            SEND=$(curl -s -X POST "${API}/sendVideo" -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true)
+          else
+            SEND=$(curl -s -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
+          fi
 
-            HTTP_CODE=$(echo "$SEND_RAW" | tail -n1 | sed -E 's/__HTTP_CODE__:(.*)/\1/')
-            SEND_JSON=$(echo "$SEND_RAW" | sed '$d')
-
-            echo "sendVideo http:$HTTP_CODE response:"
-            echo "$SEND_JSON" | jq . || true
-
-            ok=$(echo "$SEND_JSON" | jq -r '.ok // false')
-            if [ "$ok" = "true" ]; then
-              NEW_MSG_ID=$(echo "$SEND_JSON" | jq -r '.result.message_id')
-              NEW_FILE_ID=$(echo "$SEND_JSON" | jq -r '.result.video.file_id // .result.document.file_id // empty')
-              jq -n --arg m "$NEW_MSG_ID" --arg f "$NEW_FILE_ID" '{message_id:$m|tonumber, file_id:$f}' > "$STATE_FILE"
-              echo "Sent and recorded new message: $NEW_MSG_ID"
-              break
-            fi
-
-            # retry on rate-limit or server errors
-            if [ "$HTTP_CODE" = "429" ] || [[ "$HTTP_CODE" =~ ^5 ]]; then
-              sleep $((attempt * 5))
-              continue
-            fi
-
-            # non-retryable error => save it and exit non-zero
-            echo "$SEND_JSON" > error.send.json
-            echo "Non-retryable Telegram error saved to error.send.json"
+          echo "sendVideo response:" | jq -r . <<<"$SEND" || echo "$SEND"
+          ok=$(echo "$SEND" | jq -r '.ok // false')
+          if [ "$ok" != "true" ]; then
+            echo "Telegram send failed:" && echo "$SEND" | jq . || true
             exit 1
-          done
+          fi
 
-      - name: Commit updated state.json (safe push with rebase + retry)
+          NEW_MSG_ID=$(echo "$SEND" | jq -r '.result.message_id')
+          NEW_FILE_ID=$(echo "$SEND" | jq -r '.result.video.file_id // .result.document.file_id // empty')
+          jq -n --arg m "$NEW_MSG_ID" --arg f "$NEW_FILE_ID" '{message_id:$m|tonumber, file_id:$f}' > "$STATE_FILE"
+
+      - name: Save updated state back to gist
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          STATE_FILE: state.json
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if git status --porcelain | grep -q state.json; then
-            git add state.json
-            git commit -m "Update telegram state"
-
-            # Try pushing, but if rejected pull/rebase and retry a few times
-            tries=0
-            maxpush=4
-            until git push origin HEAD:main; do
-              tries=$((tries+1))
-              echo "Push failed, attempting to fetch/rebase (attempt $tries/$maxpush)..."
-              git fetch origin main
-              # rebase our commit onto origin/main; if rebase fails, try pull --rebase
-              git rebase origin/main || git pull --rebase origin main || true
-              if [ $tries -ge $maxpush ]; then
-                echo "Push failed after $maxpush attempts. Exiting with error."
-                git log -n 5 --oneline
-                exit 1
-              fi
-              sleep 2
-            done
-            echo "state.json pushed successfully."
-          else
-            echo "No state.json changes to commit."
+          if [ -z "${GIST_ID+x}" ] || [ -z "$GIST_ID" ]; then
+            echo "GIST_ID unset. Save the created gist id to repo secrets as GIST_ID for future runs." && exit 0
           fi
+          CONTENT=$(jq -Rs '.' < "$STATE_FILE") # raw string as JSON
+          PAYLOAD=$(jq -n --arg c "$CONTENT" '{ files: { "state.json": { "content": ($c|fromjson) } } }')
+          RESPONSE=$(curl -s -X PATCH -H "Authorization: token ${GIST_TOKEN}" -H "Content-Type: application/json" -d "$PAYLOAD" "https://api.github.com/gists/${GIST_ID}")
+          echo "Gist update response:"
+          echo "$RESPONSE" | jq . || true
