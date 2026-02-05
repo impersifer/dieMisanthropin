@@ -2,7 +2,7 @@ name: Refresh Telegram Video
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 15 minutes (min interval is 5 min). Change if needed. 
+    - cron: '*/5 * * * *'   # every 5 minutes (min interval is 5 min). Change if needed. 
   workflow_dispatch:
 
 # <-- grant write permission for commits/pushes
@@ -13,79 +13,150 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+
+    # Avoid overlapping runs (queue new runs until the current finishes)
+    concurrency:
+      group: refresh-telegram-video-${{ github.ref }}
+      cancel-in-progress: false
+
     steps:
       - name: Checkout repo (read/write)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Make sure we have the latest main
+        shell: bash
+        run: |
+          # ensure we are tracking remote main and up-to-date before reading state.json
+          git fetch --all --prune
+          git checkout main || git checkout -b main origin/main
+          git reset --hard origin/main
 
       - name: Install jq & curl
         run: sudo apt-get update && sudo apt-get install -y jq curl
 
-      - name: Run refresh script
+      - name: Run refresh script (verbose, robust)
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state.json
-          VIDEO_PATH: :3.mp4     # path inside the repo, change if you use external hosting
-          EXTERNAL_VIDEO_URL: ""    # optional: set a publicly accessible URL
+          VIDEO_PATH: video.mp4
+          EXTERNAL_VIDEO_URL: ""
         run: |
           set -euo pipefail
           API="https://api.telegram.org/bot${BOT_TOKEN}"
 
+          # ensure we have freshest state.json (re-check after latest fetch)
+          git fetch origin main
+          git reset --hard origin/main
+
           # load previous state
+          MESSAGE_ID=""
+          FILE_ID=""
           if [ -f "$STATE_FILE" ]; then
             MESSAGE_ID=$(jq -r '.message_id // empty' "$STATE_FILE" || echo "")
             FILE_ID=$(jq -r '.file_id // empty' "$STATE_FILE" || echo "")
-          else
-            MESSAGE_ID=""
-            FILE_ID=""
           fi
+
+          echo "Starting refresh at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "Prev message_id: '${MESSAGE_ID:-<empty>}'"
+          echo "Prev file_id: '${FILE_ID:0:8}... (redacted if present)'"
 
           # delete old message (best-effort)
           if [ -n "$MESSAGE_ID" ]; then
-            curl -s -X POST "${API}/deleteMessage" -d chat_id="${CHAT_ID}" -d message_id="${MESSAGE_ID}" || true
+            echo "Deleting previous message id=$MESSAGE_ID..."
+            DEL_RESP=$(curl -s -X POST "${API}/deleteMessage" -d chat_id="${CHAT_ID}" -d message_id="${MESSAGE_ID}" -w "\n__HTTP_CODE__:%{http_code}")
+            HTTP_CODE=$(echo "$DEL_RESP" | tail -n1 | sed -E 's/__HTTP_CODE__:(.*)/\1/')
+            DEL_JSON=$(echo "$DEL_RESP" | sed '$d')
+            echo "deleteMessage http:$HTTP_CODE ->"
+            echo "$DEL_JSON" | jq . || true
+            # proceed even if delete failed (message might already be gone)
+          else
+            echo "No previous message id found; skipping delete."
           fi
 
-          # If no file_id but EXTERNAL_VIDEO_URL is set, fetch the file to /tmp/video.mp4 and upload
+          # optionally download external video if provided
           if [ -z "$FILE_ID" ] && [ -n "$EXTERNAL_VIDEO_URL" ]; then
             echo "Downloading external video..."
             curl -sSfL "$EXTERNAL_VIDEO_URL" -o /tmp/video.mp4
             VIDEO_PATH="/tmp/video.mp4"
           fi
 
-          # send video: reuse file_id if present, otherwise upload the file from VIDEO_PATH
-          if [ -n "$FILE_ID" ]; then
-            SEND=$(curl -s -X POST "${API}/sendVideo" -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true)
-          else
-            if [ ! -f "$VIDEO_PATH" ]; then
-              echo "No file $VIDEO_PATH found. Set VIDEO_PATH or EXTERNAL_VIDEO_URL." >&2
-              exit 1
+          # send video (with safe logging + retry for transient errors)
+          attempt=0
+          max_attempts=3
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt+1))
+            echo "Send attempt #$attempt..."
+            if [ -n "$FILE_ID" ]; then
+              SEND_RAW=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST "${API}/sendVideo" -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true)
+            else
+              if [ ! -f "$VIDEO_PATH" ]; then
+                echo "No file at $VIDEO_PATH. Set VIDEO_PATH or EXTERNAL_VIDEO_URL." >&2
+                exit 1
+              fi
+              SEND_RAW=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
             fi
-            SEND=$(curl -s -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
-          fi
 
-          ok=$(echo "$SEND" | jq -r '.ok')
-          if [ "$ok" != "true" ]; then
-            echo "Telegram API error: $SEND" >&2
+            HTTP_CODE=$(echo "$SEND_RAW" | tail -n1 | sed -E 's/__HTTP_CODE__:(.*)/\1/')
+            SEND_JSON=$(echo "$SEND_RAW" | sed '$d')
+
+            echo "sendVideo http:$HTTP_CODE response:"
+            echo "$SEND_JSON" | jq . || true
+
+            ok=$(echo "$SEND_JSON" | jq -r '.ok // false')
+            if [ "$ok" = "true" ]; then
+              NEW_MSG_ID=$(echo "$SEND_JSON" | jq -r '.result.message_id')
+              NEW_FILE_ID=$(echo "$SEND_JSON" | jq -r '.result.video.file_id // .result.document.file_id // empty')
+              jq -n --arg m "$NEW_MSG_ID" --arg f "$NEW_FILE_ID" '{message_id:$m|tonumber, file_id:$f}' > "$STATE_FILE"
+              echo "Sent and recorded new message: $NEW_MSG_ID"
+              break
+            fi
+
+            # retry on rate-limit or server errors
+            if [ "$HTTP_CODE" = "429" ] || [[ "$HTTP_CODE" =~ ^5 ]]; then
+              sleep $((attempt * 5))
+              continue
+            fi
+
+            # non-retryable error => save it and exit non-zero
+            echo "$SEND_JSON" > error.send.json
+            echo "Non-retryable Telegram error saved to error.send.json"
             exit 1
-          fi
+          done
 
-          NEW_MSG_ID=$(echo "$SEND" | jq -r '.result.message_id')
-          NEW_FILE_ID=$(echo "$SEND" | jq -r '.result.video.file_id // .result.document.file_id // empty')
-
-          jq -n --arg m "$NEW_MSG_ID" --arg f "$NEW_FILE_ID" '{message_id:$m|tonumber, file_id:$f}' > "$STATE_FILE"
-
-      - name: Commit updated state.json
+      - name: Commit updated state.json (safe push with rebase + retry)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if git status --porcelain | grep -q state.json; then
             git add state.json
             git commit -m "Update telegram state"
-            git push
+
+            # Try pushing, but if rejected pull/rebase and retry a few times
+            tries=0
+            maxpush=4
+            until git push origin HEAD:main; do
+              tries=$((tries+1))
+              echo "Push failed, attempting to fetch/rebase (attempt $tries/$maxpush)..."
+              git fetch origin main
+              # rebase our commit onto origin/main; if rebase fails, try pull --rebase
+              git rebase origin/main || git pull --rebase origin main || true
+              if [ $tries -ge $maxpush ]; then
+                echo "Push failed after $maxpush attempts. Exiting with error."
+                git log -n 5 --oneline
+                exit 1
+              fi
+              sleep 2
+            done
+            echo "state.json pushed successfully."
           else
-            echo "No changes to commit."
+            echo "No state.json changes to commit."
           fi
