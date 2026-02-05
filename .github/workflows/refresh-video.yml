@@ -60,7 +60,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state.json
-          VIDEO_PATH: ':3.mp4'            # <<— kept exactly per your request (note the single quotes)
+          VIDEO_PATH: 'video.mp4'          
           EXTERNAL_VIDEO_URL: ''          # optionally set if you want remote fetch
         run: |
           set -euo pipefail
