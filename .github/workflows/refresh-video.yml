@@ -5,6 +5,11 @@ on:
     - cron: '*/5 * * * *'   # every 15 minutes (min interval is 5 min). Change if needed. 
   workflow_dispatch:
 
+# <-- grant write permission for commits/pushes
+permissions:
+  contents: write
+
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
