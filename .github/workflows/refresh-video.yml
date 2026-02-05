@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq curl
+        run: sudo apt-get update. && sudo apt-get install -y jq curl
 
       - name: Get state from gist (or create gist)
         env:
@@ -60,7 +60,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state.json
-          VIDEO_PATH: video.mp4
+          VIDEO_PATH: :3.mp4
           EXTERNAL_VIDEO_URL: ""
         run: |
           set -euo pipefail
