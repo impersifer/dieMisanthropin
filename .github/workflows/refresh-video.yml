@@ -2,177 +2,77 @@ name: Refresh Telegram Video
 
 on:
   schedule:
-    - cron: '*/6 * * * *'   # every 6 minutes; adjust if you want (GitHub min granularity is 5m)
+    - cron: '*/6 * * * *'   # every 15 minutes; change as desired (min 5m)
   workflow_dispatch:
-
-permissions:
-  contents: read   # we don't push to the repo; only read
-  # GIST_TOKEN must be provided as a repo secret (see below)
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    concurrency:
-      group: refresh-telegram-video-${{ github.ref }}
-      cancel-in-progress: true
-
     steps:
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq curl
+      - name: Checkout repo (read/write)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read / create Gist state
-        env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          # optional: set GIST_ID in repo secrets once created to avoid recreation each run
-          GIST_ID: ${{ secrets.GIST_ID || '' }}
-          STATE_FILE: state.json
-        run: |
-          set -euo pipefail
+      - name: Set up jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-          AUTH_HEADER="Authorization: token ${GIST_TOKEN}"
-          if [ -n "${GIST_ID}" ]; then
-            echo "Fetching existing gist ${GIST_ID}..."
-            GIST_JSON=$(curl -s -H "$AUTH_HEADER" "https://api.github.com/gists/${GIST_ID}")
-            if echo "$GIST_JSON" | jq -e '.message' >/dev/null 2>&1; then
-              echo "Failed to fetch gist id=${GIST_ID}:" >&2
-              echo "$GIST_JSON" | jq .
-              exit 1
-            fi
-            echo "$GIST_JSON" | jq -r '.files["state.json"].content // "{}"' > "$STATE_FILE"
-          else
-            echo "No GIST_ID provided: creating a new private gist..."
-            PAYLOAD=$(jq -n '{ "description":"telegram-state-for-refresh-video", "public": false, "files": { "state.json": {"content": "{}"} } }')
-            CREATE=$(curl -s -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$PAYLOAD" https://api.github.com/gists)
-            GIST_ID_OUT=$(echo "$CREATE" | jq -r '.id // empty')
-            if [ -z "$GIST_ID_OUT" ]; then
-              echo "Failed to create gist:" >&2
-              echo "$CREATE" | jq .
-              exit 1
-            fi
-            echo "Created gist id: $GIST_ID_OUT"
-            echo "$CREATE" | jq -r '.files["state.json"].content // "{}"' > "$STATE_FILE"
-            echo "Save this id as the repo secret GIST_ID for future runs: $GIST_ID_OUT"
-            # do not exit; continue using the locally-created state.json for this run
-          fi
-
-      - name: Refresh Telegram video (robust send)
+      - name: Run refresh script
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state.json
-          VIDEO_PATH: 'video.mp4'          
-          EXTERNAL_VIDEO_URL: ''          # optionally set if you want remote fetch
+          VIDEO_PATH: video.mp4
         run: |
           set -euo pipefail
-
           API="https://api.telegram.org/bot${BOT_TOKEN}"
-          STATE_FILE="state.json"
-
-          # safe read previous state
-          MESSAGE_ID=""
-          FILE_ID=""
+          # load previous state if exists
           if [ -f "$STATE_FILE" ]; then
-            MESSAGE_ID=$(jq -r '.message_id // empty' "$STATE_FILE" 2>/dev/null || echo "")
-            FILE_ID=$(jq -r '.file_id // empty' "$STATE_FILE" 2>/dev/null || echo "")
-          fi
-
-          # ensure variables defined (avoid unbound var with set -u)
-          : "${FILE_ID:=}"
-          : "${VIDEO_PATH:=${VIDEO_PATH:-}}"
-          : "${EXTERNAL_VIDEO_URL:=${EXTERNAL_VIDEO_URL:-}}"
-
-          echo "MESSAGE_ID='${MESSAGE_ID:-<empty>}'"
-          if [ -n "$FILE_ID" ]; then
-            echo "FILE_ID='${FILE_ID:0:8}... (redacted)'"
+            MESSAGE_ID=$(jq -r '.message_id // empty' "$STATE_FILE" || echo "")
+            FILE_ID=$(jq -r '.file_id // empty' "$STATE_FILE" || echo "")
           else
-            echo "FILE_ID='<empty>'"
+            MESSAGE_ID=""
+            FILE_ID=""
           fi
-          echo "VIDEO_PATH='$VIDEO_PATH'"
-          echo "EXTERNAL_VIDEO_URL='${EXTERNAL_VIDEO_URL:+<set>}'"
 
-          # Delete previous message (best-effort)
+          # delete old message (best effort)
           if [ -n "$MESSAGE_ID" ]; then
-            echo "Attempting to delete previous message $MESSAGE_ID..."
             curl -s -X POST "${API}/deleteMessage" -d chat_id="${CHAT_ID}" -d message_id="${MESSAGE_ID}" || true
           fi
 
-          # If no file_id and EXTERNAL_VIDEO_URL provided, download it
-          FOUND_PATH=""
-          if [ -z "$FILE_ID" ] && [ -n "$EXTERNAL_VIDEO_URL" ]; then
-            echo "Downloading external video from $EXTERNAL_VIDEO_URL..."
-            curl -sSfL "$EXTERNAL_VIDEO_URL" -o /tmp/video.mp4
-            FOUND_PATH="/tmp/video.mp4"
-          else
-            # try the exact path and ./path — this handles filenames starting with ':' as requested
-            for candidate in "$VIDEO_PATH" "./$VIDEO_PATH"; do
-              if [ -f "$candidate" ]; then
-                FOUND_PATH="$candidate"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$FILE_ID" ] && [ -z "$FOUND_PATH" ]; then
-            echo "ERROR: No file_id and video file not found at '$VIDEO_PATH' or './$VIDEO_PATH'." >&2
-            echo "Working dir listing (repo root):"
-            ls -la || true
-            exit 1
-          fi
-
-          # send with HTTP code appended so we can inspect non-JSON server output
+          # send video (reuse file_id if present, otherwise upload file)
           if [ -n "$FILE_ID" ]; then
-            SEND_RAW=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST "${API}/sendVideo" \
-              -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true) || true
+            SEND=$(curl -s -X POST "${API}/sendVideo" -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true)
           else
-            SEND_RAW=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" -X POST "${API}/sendVideo" \
-              -F chat_id="${CHAT_ID}" -F "video=@${FOUND_PATH}" -F disable_notification=true) || true
+            if [ ! -f "$VIDEO_PATH" ]; then
+              echo "No file $VIDEO_PATH found in repo. Put your video there." >&2
+              exit 1
+            fi
+            SEND=$(curl -s -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
           fi
 
-          HTTP_CODE=$(printf '%s' "$SEND_RAW" | tail -n1 | sed -E 's/__HTTP_CODE__:(.*)/\1/')
-          SEND_JSON=$(printf '%s' "$SEND_RAW" | sed '$d' || true)
-
-          # persist raw response for debugging
-          printf '%s\n\n__HTTP_CODE__:%s\n' "$SEND_JSON" "$HTTP_CODE" > send.raw.txt
-
-          echo "sendVideo HTTP code: $HTTP_CODE"
-          printf 'sendVideo response (first 1000 chars):\n'; printf '%s' "$SEND_JSON" | head -c 1000 || true
-
-          # ensure JSON before parsing
-          if ! printf '%s' "$SEND_JSON" | jq -e . >/dev/null 2>&1; then
-            echo "ERROR: Telegram response not valid JSON. Inspect send.raw.txt" >&2
-            sed -n '1,200p' send.raw.txt || true
-            exit 1
-          fi
-
-          ok=$(printf '%s' "$SEND_JSON" | jq -r '.ok // false')
+          ok=$(echo "$SEND" | jq -r '.ok')
           if [ "$ok" != "true" ]; then
-            echo "Telegram API returned ok=false. Full response:"
-            printf '%s\n' "$SEND_JSON" | jq .
+            echo "Telegram API error: $SEND"
             exit 1
           fi
 
-          NEW_MSG_ID=$(printf '%s' "$SEND_JSON" | jq -r '.result.message_id')
-          NEW_FILE_ID=$(printf '%s' "$SEND_JSON" | jq -r '.result.video.file_id // .result.document.file_id // empty')
+          NEW_MSG_ID=$(echo "$SEND" | jq -r '.result.message_id')
+          # video might be in .result.video or .result.document
+          NEW_FILE_ID=$(echo "$SEND" | jq -r '.result.video.file_id // .result.document.file_id // empty')
 
-          # write local state.json (this will be uploaded to the gist next step)
           jq -n --arg m "$NEW_MSG_ID" --arg f "$NEW_FILE_ID" '{message_id:$m|tonumber, file_id:$f}' > "$STATE_FILE"
-          echo "Success: posted message $NEW_MSG_ID; updated $STATE_FILE"
 
-      - name: Save updated state back to gist
+      - name: Commit updated state.json
         env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID || '' }}
-          STATE_FILE: state.json
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -z "${GIST_ID+x}" ] || [ -z "$GIST_ID" ]; then
-            echo "GIST_ID unset. Save the created gist id (printed earlier) into the repo secret GIST_ID for future runs."
-            exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain | grep -q state.json; then
+            git add state.json
+            git commit -m "Update telegram state"
+            git push
+          else
+            echo "No changes to commit."
           fi
-
-          # read the file content safely and build PATCH payload
-          CONTENT=$(jq -Rs '.' "$STATE_FILE")
-          PAYLOAD=$(jq -n --argjson c "$CONTENT" '{ files: { "state.json": { "content": ($c) } } }')
-          RESPONSE=$(curl -s -X PATCH -H "Authorization: token ${GIST_TOKEN}" -H "Content-Type: application/json" -d "$PAYLOAD" "https://api.github.com/gists/${GIST_ID}")
-          echo "Gist update response (first 500 chars):"
-          printf '%s' "$RESPONSE" | head -c 500 || true
