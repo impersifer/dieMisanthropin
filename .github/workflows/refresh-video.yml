@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Install tools
-        run: sudo apt-get update. && sudo apt-get install -y jq curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
 
       - name: Get state from gist (or create gist)
         env:
@@ -33,26 +33,24 @@ jobs:
             echo "Fetching existing gist ${GIST_ID}..."
             GIST_JSON=$(curl -s -H "$AUTH_HEADER" "https://api.github.com/gists/${GIST_ID}")
             if echo "$GIST_JSON" | jq -e '.message' >/dev/null 2>&1; then
-              echo "Failed to fetch gist id=${GIST_ID}:"
+              echo "Failed to fetch gist id=${GIST_ID}:" >&2
               echo "$GIST_JSON" | jq .
               exit 1
             fi
-            echo "$GIST_JSON" | jq -r '.files["state.json"].content // empty' > "$STATE_FILE" || echo "{}" > "$STATE_FILE"
+            echo "$GIST_JSON" | jq -r '.files["state.json"].content // "{}"' > "$STATE_FILE"
           else
-            echo "No GIST_ID secret provided: creating a new gist..."
+            echo "No GIST_ID provided: creating a new private gist..."
             PAYLOAD=$(jq -n '{ "description":"telegram-state-for-refresh-video", "public": false, "files": { "state.json": {"content": "{}"} } }')
             CREATE=$(curl -s -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$PAYLOAD" https://api.github.com/gists)
             GIST_ID_OUT=$(echo "$CREATE" | jq -r '.id // empty')
             if [ -z "$GIST_ID_OUT" ]; then
-              echo "Failed to create gist:" && echo "$CREATE" | jq .
+              echo "Failed to create gist:" >&2
+              echo "$CREATE" | jq .
               exit 1
             fi
             echo "Created gist id: $GIST_ID_OUT"
-            echo "Please save this id as the repo secret GIST_ID for future runs."
-            echo "$CREATE" | jq -r '.files["state.json"].content // {}' > "$STATE_FILE"
-            # print id for convenience
-            echo "GIST_ID=$GIST_ID_OUT"
-            # optionally write to file so logs show it (but secret is needed afterwards)
+            echo "$CREATE" | jq -r '.files["state.json"].content // "{}"' > "$STATE_FILE"
+            echo "Save this id as the repo secret GIST_ID for future runs: $GIST_ID_OUT"
           fi
 
       - name: Refresh Telegram video (use gist-state)
@@ -84,10 +82,12 @@ jobs:
             SEND=$(curl -s -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
           fi
 
-          echo "sendVideo response:" | jq -r . <<<"$SEND" || echo "$SEND"
+          echo "sendVideo response:"
+          echo "$SEND" | jq . || true
           ok=$(echo "$SEND" | jq -r '.ok // false')
           if [ "$ok" != "true" ]; then
-            echo "Telegram send failed:" && echo "$SEND" | jq . || true
+            echo "Telegram send failed:" >&2
+            echo "$SEND" | jq . || true
             exit 1
           fi
 
@@ -105,7 +105,7 @@ jobs:
           if [ -z "${GIST_ID+x}" ] || [ -z "$GIST_ID" ]; then
             echo "GIST_ID unset. Save the created gist id to repo secrets as GIST_ID for future runs." && exit 0
           fi
-          CONTENT=$(jq -Rs '.' < "$STATE_FILE") # raw string as JSON
+          CONTENT=$(jq -Rs '.' < "$STATE_FILE")
           PAYLOAD=$(jq -n --arg c "$CONTENT" '{ files: { "state.json": { "content": ($c|fromjson) } } }')
           RESPONSE=$(curl -s -X PATCH -H "Authorization: token ${GIST_TOKEN}" -H "Content-Type: application/json" -d "$PAYLOAD" "https://api.github.com/gists/${GIST_ID}")
           echo "Gist update response:"
