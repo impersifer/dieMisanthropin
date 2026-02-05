@@ -1,0 +1,86 @@
+name: Refresh Telegram Video
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 15 minutes (min interval is 5 min). Change if needed. 
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (read/write)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq & curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Run refresh script
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_FILE: state.json
+          VIDEO_PATH: :3.mp4     # path inside the repo, change if you use external hosting
+          EXTERNAL_VIDEO_URL: ""    # optional: set a publicly accessible URL
+        run: |
+          set -euo pipefail
+          API="https://api.telegram.org/bot${BOT_TOKEN}"
+
+          # load previous state
+          if [ -f "$STATE_FILE" ]; then
+            MESSAGE_ID=$(jq -r '.message_id // empty' "$STATE_FILE" || echo "")
+            FILE_ID=$(jq -r '.file_id // empty' "$STATE_FILE" || echo "")
+          else
+            MESSAGE_ID=""
+            FILE_ID=""
+          fi
+
+          # delete old message (best-effort)
+          if [ -n "$MESSAGE_ID" ]; then
+            curl -s -X POST "${API}/deleteMessage" -d chat_id="${CHAT_ID}" -d message_id="${MESSAGE_ID}" || true
+          fi
+
+          # If no file_id but EXTERNAL_VIDEO_URL is set, fetch the file to /tmp/video.mp4 and upload
+          if [ -z "$FILE_ID" ] && [ -n "$EXTERNAL_VIDEO_URL" ]; then
+            echo "Downloading external video..."
+            curl -sSfL "$EXTERNAL_VIDEO_URL" -o /tmp/video.mp4
+            VIDEO_PATH="/tmp/video.mp4"
+          fi
+
+          # send video: reuse file_id if present, otherwise upload the file from VIDEO_PATH
+          if [ -n "$FILE_ID" ]; then
+            SEND=$(curl -s -X POST "${API}/sendVideo" -d chat_id="${CHAT_ID}" -d video="${FILE_ID}" -d disable_notification=true)
+          else
+            if [ ! -f "$VIDEO_PATH" ]; then
+              echo "No file $VIDEO_PATH found. Set VIDEO_PATH or EXTERNAL_VIDEO_URL." >&2
+              exit 1
+            fi
+            SEND=$(curl -s -X POST "${API}/sendVideo" -F chat_id="${CHAT_ID}" -F "video=@${VIDEO_PATH}" -F disable_notification=true)
+          fi
+
+          ok=$(echo "$SEND" | jq -r '.ok')
+          if [ "$ok" != "true" ]; then
+            echo "Telegram API error: $SEND" >&2
+            exit 1
+          fi
+
+          NEW_MSG_ID=$(echo "$SEND" | jq -r '.result.message_id')
+          NEW_FILE_ID=$(echo "$SEND" | jq -r '.result.video.file_id // .result.document.file_id // empty')
+
+          jq -n --arg m "$NEW_MSG_ID" --arg f "$NEW_FILE_ID" '{message_id:$m|tonumber, file_id:$f}' > "$STATE_FILE"
+
+      - name: Commit updated state.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain | grep -q state.json; then
+            git add state.json
+            git commit -m "Update telegram state"
+            git push
+          else
+            echo "No changes to commit."
+          fi
