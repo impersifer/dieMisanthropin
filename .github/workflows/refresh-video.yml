@@ -2,7 +2,7 @@ name: Refresh Telegram Video
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes (min interval is 5 min). Change if needed. 
+    - cron: '*/6 * * * *'   # every 5 minutes (min interval is 5 min). Change if needed. 
   workflow_dispatch:
 
 # <-- grant write permission for commits/pushes
